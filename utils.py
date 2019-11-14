@@ -1,3 +1,5 @@
+import torch
+
 
 def assign_and_sample(proposals, gt_bboxes, gt_clses, cfg):
     '''
@@ -31,18 +33,30 @@ def feat_extract(feats, sample_bboxes, cfg):
     :return: rois: Tensor, [num_samples, C, H, W]
     '''
 
-
-def rpn_assign_and_sample(mlv_anchors, gt_clses, gt_bboxes):
+def assign(mlv_anchors, mlv_valid_masks, gt_cls, gt_bbox, cfg):
     '''
 
     :param mlv_anchors:
-    :param gt_clses:
-    :param gt_bboxes:
-    :return: pos_inds: list[Tensor]. [num_positive_samples, ]. Indices for positive sample
-    anchors for each level. Anchors are arranged as [h*w*num_anchors, ].
-    gt_bboxes_inds: list[Tensor]. [num_positive_samples, ]. Indices of corresponding
-    ground-truth bboxes for each level.
+    :param mlv_valid_masks:
+    :param gt_cls:
+    :param gt_bbox:
+    :param cfg:
+    :return: labels: Tensor, [h*w*num_anchors, ], indices of gt_bboxes.
+        Positive samples: 1; Negative samples: -1; Ignored samples: 0
+    targets: Tensor, [h*w*num_anchors, 4]
     '''
+
+def sample(labels, cfg):
+    '''
+    Get both positive and negative samples
+    :param labels: Tensor, [h*w*num_anchors, ]
+    :param cfg:
+    :return: labels. Positive samples: 1; Negative samples: -1; Ignored samples: 0
+    '''
+
+
+def unmap(sample_labels, num_anchors, mlv_sizes):
+
 
 
 class AnchorGenerator(object):
@@ -63,7 +77,7 @@ class AnchorGenerator(object):
         '''
         obtain anchors in the feature maps with the size of feat_size
         :param feat_size: tuple. (h, w)
-        :return: anchors: Tensor. [h, w, num_anchors, 4].
-        valid_mask: Tensor. [h, w, num_anchors]
+        :return: anchors: Tensor. [h*w*num_anchors, 4].
+        valid_mask: Tensor. [h*w*num_anchors]
         '''
 

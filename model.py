@@ -99,12 +99,15 @@ class RPN(nn.Module):
         self.rpn_conv = nn.Conv2d(channels_in, channels_out, kernel_size=3, stride=1,
                                   padding=1)
         self.cls = None
+        self.loss_fn = None
         if out_activation == 'sigmoid':
             self.cls = nn.Conv2d(channels_out, self.num_anchors, kernel_size=1, stride=1,
                                  padding=0)
+            self.loss_fn = torch.nn.BCELoss()
         elif out_activation == 'softmax':
             self.cls = nn.Conv2d(channels_out, self.num_anchors * 2, kernel_size=1,
                                  stride=1, padding=0)
+            self.loss_fn = torch.nn.CrossEntropyLoss()
         else:
             raise Exception("No type {} in classification activation".format(out_activation))
         self.reg = nn.Conv2d(channels_out, self.num_anchors * 4, kernel_size=1, stride=1,
@@ -151,48 +154,99 @@ class RPN(nn.Module):
         :return: rpn_loss: Scalar.
         '''
 
-        num_imgs = len(gt_clses)
         rpn_loss = 0
-        for i in range(num_imgs):
-            rpn_cls_scores_per_img = [rpn_cls_scores[j][i] for j in range(self.num_levels)]
-            rpn_bboxes_per_img = [rpn_loc_preds[j][i] for j in range(self.num_levels)]
-            rpn_loss += self.loss_single(rpn_cls_scores_per_img, rpn_bboxes_per_img,
-                                         gt_clses[i], gt_bboxes[i])
+
+        mlv_sizes = [rpn_cls_scores[i].size()[-2:] for i in range(self.num_levels)]
+        mlv_anchors = [self.anchor_generator.grid_anchors(size)
+                       for size in mlv_sizes]
+
+        # merge anchors of different levels into a single Tensor
+        mlv_valid_masks = torch.cat([anchors[1].to(dtype=torch.uint8) for anchors in mlv_anchors])
+        mlv_anchors = torch.cat([anchors[0] for anchors in mlv_anchors])
+
+        labels_lists, targets_lists = self.rpn_assign_and_sample(mlv_sizes, mlv_anchors,
+                                                                 mlv_valid_masks, gt_clses, gt_bboxes)
+        for i, labels in enumerate(labels_lists):
+            targets = targets_lists[i]
+            rpn_loss += self.loss_single(rpn_cls_scores[i], rpn_loc_preds[i],
+                                         labels, targets)
         return rpn_loss
 
-    def loss_single(self, rpn_cls_scores, rpn_loc_preds, gt_cls, gt_bbox):
+    def rpn_assign_and_sample_single(self, mlv_sizes, mlv_anchors, mlv_valid_masks, gt_cls, gt_bbox):
         '''
-        compute rpn loss from a single image
-        :param rpn_cls_scores: list[Tensor], represents predicted class scores in
-        different levels of feature maps. Each Tensor has the shape [num_anchors, H, W].
-        :param rpn_loc_preds: list[Tensor], represents predicted localization in
-        different levels of feature maps. Each Tensor has the shape [num_anchors*4, H, W].
-        :param gt_cls: Tensor, [num_bboxes,], represents the ground-truth class index for
-        only one image.
-        :param gt_bbox: Tensor, [num_bboxes, 4], represents the ground-truth bbox coordinates
-        for only one image.
-        :return: loss_rpn: Scalar
+        assign and sample anchors for a single image
+        :return: labels: list[Tensor], each of Tensor has shape [1, num_anchors, H, W]
+        targets: list[Tensor], each of Tensor has shape [1, num_anchors*4, H, W]
         '''
 
-        rpn_loss = 0
-        mlv_anchors = [self.anchor_generator.grid_anchors(rpn_cls_scores[i].size()[-2:])
-                       for i in range(len(rpn_cls_scores))]
+        labels, targets = assign(mlv_anchors, mlv_valid_masks, gt_cls, gt_bbox, self.cfg)
 
-        # TODO: merge anchors of different levels into a single Tensor
-        mlv_valid_masks = [anchors[1] for anchors in mlv_anchors]
-        mlv_anchors = [anchors[0] for anchors in mlv_anchors]
-        pos_inds, gt_bbox_inds = rpn_assign_and_sample(mlv_anchors, gt_cls, gt_bbox)
-        gt_targets = bbox2loc(gt_bbox)
+        sample_labels = sample(labels, self.cfg)
+        sample_targets = targets * (sample_labels == 1).to(dtype=torch.float)
 
-        # cls loss
-        loss_cls =
+        labels = unmap(sample_labels, self.num_anchors, mlv_sizes)
+        targets = unmap(sample_targets, self.num_anchors*4, mlv_sizes)
 
-        # loc loss
-        gt_pos_targets = [gt_targets[gt_bbox_inds[i].to(dtype=torch.uint8)]
-                          for i in range(self.num_levels)]
-        pos_targets = [rpn_loc_preds[i].permute(1,2,0).view(-1, 4)[pos_inds[i]]
-                       for i in range(self.num_levels)]
-        loss_loc =
+        return labels, targets
+
+    def rpn_assign_and_sample(self, mlv_sizes, mlv_anchors, mlv_valid_masks, gt_clses, gt_bboxes):
+        '''
+        Get ground-truth labels and targets
+        :param mlv_sizes: list[tuple], means feature map size for different levels
+        :param mlv_anchors: Tensor, means [num_all_anchors, 4] for different levels
+        :param mlv_valid_masks: Tensor, means [num_all_anchors, ] for different levels
+        :param gt_clses: list[Tensor], [num_bboxes, ], ground-truth class for all bboxes for all levels.
+        :param gt_bboxes: list[Tenosr], [num_bboxes, 4], ground-truth bboxes for all bboxes for all levels.
+        :return: labels: list[Tensor]. Ground-truth class labels.
+        targets: list[Tensor]. Corresponding ground-truth bboxes.
+        '''
+
+        # split the inputs into each image, and get the final targets and labels for all images
+        num_imgs = len(gt_clses)
+        labels_lists, targets_lists = [], []
+        for i in range(num_imgs):
+            labels, targets = self.rpn_assign_and_sample_single(mlv_sizes, mlv_anchors, mlv_valid_masks,
+                                                           gt_clses[i], gt_bboxes[i])
+            labels_lists.append(labels)
+            targets_lists.append(targets)
+        labels, targets = [], []
+        for i in range(self.num_levels):
+            labels.append(torch.cat([labels_lists[j][i] for j in range(num_imgs)]))
+            targets.append(torch.cat([targets_lists[j][i] for j in range(num_imgs)]))
+        return labels, targets
+
+    def loss_single(self, rpn_cls_score, rpn_loc_pred, labels, targets):
+        '''
+        compute rpn loss from a single level
+        :param rpn_cls_score: Tensor, has shape as [N, num_anchors, H, W] if sigmoid,
+        [N, num_anchors*2, H, W] if softmax, represents predicted class scores in a single level.
+        :param rpn_loc_pred: Tensor, has shape as [N, num_anchors*4, H, W]
+        :param labels: Tensor, has the same shape as rpn_cls_score
+        :param targets: Tensor, the same shape as rpn_loc_pred
+        :return: loss_rpn
+        '''
+
+        # rpn_loss = 0
+        # mlv_anchors = [self.anchor_generator.grid_anchors(rpn_cls_scores[i].size()[-2:])
+        #                for i in range(len(rpn_cls_scores))]
+        #
+        # # merge anchors of different levels into a single Tensor
+        # mlv_valid_masks = torch.cat([anchors[1].to(dtype=torch.uint8) for anchors in mlv_anchors])
+        # mlv_anchors = torch.cat([anchors[0] for anchors in mlv_anchors])
+        #
+        # pos_inds, gt_bbox_inds, neg_inds = rpn_assign_and_sample(mlv_anchors, mlv_valid_masks,
+        #                                                gt_cls, gt_bbox)
+        # gt_targets = bbox2loc(gt_bbox)
+        #
+        # # cls loss
+        # loss_cls =
+        #
+        # # loc loss
+        # gt_pos_targets = [gt_targets[gt_bbox_inds[i].to(dtype=torch.uint8)]
+        #                   for i in range(self.num_levels)]
+        # pos_targets = [rpn_loc_preds[i].permute(1,2,0).view(-1, 4)[pos_inds[i]]
+        #                for i in range(self.num_levels)]
+        # loss_loc =
 
 
     def get_proposals(self, rpn_cls_scores, rpn_bboxes):
