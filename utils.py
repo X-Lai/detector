@@ -33,11 +33,12 @@ def feat_extract(feats, sample_bboxes, cfg):
     :return: rois: Tensor, [num_samples, C, H, W]
     '''
 
+
 def assign(mlv_anchors, mlv_valid_masks, gt_cls, gt_bbox, cfg):
     '''
-    1. find those positive(set 1) anchors with overlaps with any gt bbox > pos_thresh
+    1. find those positive(set 1) anchors with overlaps with any gt bbox > assign_pos_thresh
     2. find those positive(set 1) anchors which has the most overlaps with each gt bbox
-    3. find those negative(set -1) anchors with overlaps with any gt bbox < neg_thresh
+    3. find those negative(set -1) anchors with overlaps with any gt bbox < assign_neg_thresh
     4. the rest anchors are ignored(set 0), which are not considered in the loss function.
     :param mlv_anchors: Tensor, [num_all_anchors, 4]
     :param mlv_valid_masks: Tensor, [num_all_anchors, ]
@@ -49,21 +50,81 @@ def assign(mlv_anchors, mlv_valid_masks, gt_cls, gt_bbox, cfg):
     targets: Tensor, [h*w*num_anchors, 4]
     '''
 
+    overlaps = get_overlaps(mlv_anchors, gt_bbox)
+    areas_anchors = get_areas(mlv_anchors)
+    areas_gt_bboxes = get_areas(gt_bbox)
+    overlaps = overlaps / (areas_anchors[None, :] + areas_gt_bboxes[:, None] - overlaps)
 
+    labels = torch.zeros_like(mlv_valid_masks, dtype=torch.int8)
 
+    values, indices = torch.max(overlaps, dim=0)
+    targets = gt_bbox[indices]
 
+    # The first step
+    labels[values >= cfg.assign_pos_thresh] = 1
+
+    # The second step
+    max_indices_per_gt_bbox = torch.argmax(overlaps, dim=1)
+    labels[max_indices_per_gt_bbox] = 1
+
+    # The third step
+    labels[values < cfg.assign_neg_thresh] = -1
+
+    return labels, targets
+
+def get_overlaps(anchors, gt_bbox):
+    '''
+    get areas of overlapping region
+    :param anchors:
+    :param gt_bbox:
+    :return: overlaps: [num_gt_bboxes, num_all_anchors]
+    '''
+    xs_lt = torch.max(anchors[None, :, 0], gt_bbox[:, None, 0])
+    ys_lt = torch.max(anchors[None, :, 1], gt_bbox[:, None, 1])
+    xs_rb = torch.min(anchors[None, :, 2], gt_bbox[:, None, 2])
+    ys_rb = torch.min(anchors[None, :, 3], gt_bbox[:, None, 3])
+    return (ys_rb - ys_lt) * (xs_rb - xs_lt)
+
+def get_areas(bboxes):
+    return (bboxes[:, 3] - bboxes[:, 1]) * (bboxes[:, 2] - bboxes[:, 0])
 
 def sample(labels, cfg):
     '''
-    Get both positive and negative samples
+    Randomly select positive and negative samples
     :param labels: Tensor, [h*w*num_anchors, ]
-    :param cfg:
+    :param cfg: num_samples, pos_ratio
     :return: labels. Positive samples: 1; Negative samples: -1; Ignored samples: 0
     '''
+    num_pos_samples = cfg.num_samples * cfg.pos_ratio
+    num_neg_samples = cfg.num_samples - num_pos_samples
+    pos_labels = (labels == 1).to(dtype=torch.float16)
+    max_num_pos_samples = torch.sum(pos_labels).to(dtype=torch.int)
+    if num_pos_samples > max_num_pos_samples:
+        num_pos_samples = max_num_pos_samples
+    pos_inds = torch.multinomial(pos_labels, num_pos_samples)
 
+    neg_labels = (labels == -1).to(dtype=torch.float16)
+    max_num_neg_samples = torch.sum(neg_labels).to(dtype=torch.int)
+    if num_neg_samples > max_num_neg_samples:
+        num_neg_samples = max_num_neg_samples
+    neg_inds = torch.multinomial(neg_labels, num_neg_samples)
+
+    sample_labels = torch.zeros_like(labels)
+    sample_labels[pos_inds] = 1
+    sample_labels[neg_inds] = -1
+
+    return sample_labels
 
 def unmap(sample_labels, num_anchors, mlv_sizes):
-
+    segments = [h*w*num_anchors for h, w in mlv_sizes]
+    assert sum(segments) == sample_labels.size(0)
+    labels = []
+    start = 0
+    for i, seg in enumerate(segments):
+        h, w = mlv_sizes[i]
+        labels.append(sample_labels[start:start+seg].view(1, h, w, num_anchors).permute(0, 3, 1, 2))
+        start += seg
+    return labels
 
 
 class AnchorGenerator(object):
@@ -108,10 +169,9 @@ class AnchorGenerator(object):
         anchors = (base_anchors[None, :, :] + shifts[:, None]).view(-1, 4)
 
         valid_mask = torch.ones(h*w*self.num_anchors, dtype=torch.uint8, device=device)
-        valid_mask[anchors[:, 0]<0] = 0
-        valid_mask[anchors[:, 1]<0] = 0
-        valid_mask[anchors[:, 2]>img_x] = 0
-        valid_mask[anchors[:, 3]>img_y] = 0
+        valid_mask[anchors[:, 0] < 0] = 0
+        valid_mask[anchors[:, 1] < 0] = 0
+        valid_mask[anchors[:, 2] > img_x] = 0
+        valid_mask[anchors[:, 3] > img_y] = 0
 
         return anchors, valid_mask
-
