@@ -88,14 +88,14 @@ class Neck(nn.Module):
 
 class RPN(nn.Module):
     def __init__(self, channels_in=256, channels_out=256, strides=[4, 8, 16, 32, 64],
-                 anchor_ratios=[0.5, 1., 2.], anchor_scales=8,
+                 anchor_ratios=[0.5, 1., 2.], anchor_scales=[8],
                  out_activation='sigmoid'):
         super(RPN, self).__init__()
-        num_scales = 1 if not isinstance(anchor_scales, list) else len(anchor_scales)
-        self.num_anchors = len(anchor_ratios) * num_scales
+        self.num_anchors = len(anchor_ratios) * len(anchor_scales)
         self.num_levels = len(strides)
         self.strides = strides
-        self.anchor_generator = AnchorGenerator(anchor_ratios, anchor_scales, strides)
+        self.anchor_generators = [AnchorGenerator(strides[i], anchor_ratios, anchor_scales)
+                                  for i in range(self.num_levels)]
         self.rpn_conv = nn.Conv2d(channels_in, channels_out, kernel_size=3, stride=1,
                                   padding=1)
         self.cls = None
@@ -137,7 +137,7 @@ class RPN(nn.Module):
         return outs_cls, outs_reg
 
 
-    def loss(self, rpn_cls_scores, rpn_loc_preds, gt_clses, gt_bboxes):
+    def loss(self, rpn_cls_scores, rpn_loc_preds, gt_clses, gt_bboxes, imgs_meta):
         '''
         compute loss from RPN
         :param rpn_cls_scores: list[Tensor]. A list of Tensor of shape [N, num_anchors*1, H, W]
@@ -157,11 +157,11 @@ class RPN(nn.Module):
         rpn_loss = 0
 
         mlv_sizes = [rpn_cls_scores[i].size()[-2:] for i in range(self.num_levels)]
-        mlv_anchors = [self.anchor_generator.grid_anchors(size)
-                       for size in mlv_sizes]
+        img_shape = imgs_meta[0]['img_shape']
+        mlv_anchors = [self.anchor_generators[i].grid_anchors(mlv_sizes[i], self.strides[i], img_shape) for i in range(self.num_levels)]
 
         # merge anchors of different levels into a single Tensor
-        mlv_valid_masks = torch.cat([anchors[1].to(dtype=torch.uint8) for anchors in mlv_anchors])
+        mlv_valid_masks = torch.cat([anchors[1] for anchors in mlv_anchors])
         mlv_anchors = torch.cat([anchors[0] for anchors in mlv_anchors])
 
         labels_lists, targets_lists = self.rpn_assign_and_sample(mlv_sizes, mlv_anchors,
@@ -308,7 +308,7 @@ class FasterRCNN(nn.Module):
 
         rpn_cls_scores, rpn_loc_preds = self.rpn(feats)
 
-        loss_rpn = self.rpn.loss(rpn_cls_scores, rpn_loc_preds, gt_clses, gt_bboxes)
+        loss_rpn = self.rpn.loss(rpn_cls_scores, rpn_loc_preds, gt_clses, gt_bboxes, imgs_meta)
 
         proposals = self.rpn.get_proposals(rpn_cls_scores, rpn_loc_preds)
         sample_bboxes, sample_gt_bboxes, sample_gt_clses = assign_and_sample(
