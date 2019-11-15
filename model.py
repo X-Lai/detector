@@ -158,14 +158,17 @@ class RPN(nn.Module):
 
         mlv_sizes = [rpn_cls_scores[i].size()[-2:] for i in range(self.num_levels)]
         img_shape = imgs_meta[0]['img_shape']
-        mlv_anchors = [self.anchor_generators[i].grid_anchors(mlv_sizes[i], self.strides[i], img_shape) for i in range(self.num_levels)]
+        mlv_anchors = [self.anchor_generators[i].grid_anchors(mlv_sizes[i], self.strides[i],
+                                                              img_shape)
+                       for i in range(self.num_levels)]
 
         # merge anchors of different levels into a single Tensor
         mlv_valid_masks = torch.cat([anchors[1] for anchors in mlv_anchors])
         mlv_anchors = torch.cat([anchors[0] for anchors in mlv_anchors])
 
         labels_lists, targets_lists = self.rpn_assign_and_sample(mlv_sizes, mlv_anchors,
-                                                                 mlv_valid_masks, gt_clses, gt_bboxes)
+                                                                 mlv_valid_masks, gt_clses,
+                                                                 gt_bboxes)
         for i, labels in enumerate(labels_lists):
             targets = targets_lists[i]
             rpn_loss += self.loss_single(rpn_cls_scores[i], rpn_loc_preds[i],

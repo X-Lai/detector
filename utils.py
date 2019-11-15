@@ -33,6 +33,17 @@ def feat_extract(feats, sample_bboxes, cfg):
     :return: rois: Tensor, [num_samples, C, H, W]
     '''
 
+def bbox2loc(bboxes):
+    '''
+
+    :param bboxes: Tensor, [h*w*num_anchors, 4], i.e. [x_0, y_0, x_1, y_1]
+    :return: targets: Tensor, [h*w*num_anchors, 4], i.e. [x, y, w, h]
+    '''
+    return torch.stack([(bboxes[:, 2] + bboxes[:, 0]) / 2,
+                        (bboxes[:, 3] + bboxes[:, 1]) / 2,
+                        bboxes[:, 2] - bboxes[:, 0],
+                        bboxes[:, 3] - bboxes[:, 1]])
+
 
 def assign(mlv_anchors, mlv_valid_masks, gt_cls, gt_bbox, cfg):
     '''
@@ -47,7 +58,8 @@ def assign(mlv_anchors, mlv_valid_masks, gt_cls, gt_bbox, cfg):
     :param cfg:
     :return: labels: Tensor, [h*w*num_anchors, ], indices of gt_bboxes.
         Positive samples: 1; Negative samples: -1; Ignored samples: 0
-    targets: Tensor, [h*w*num_anchors, 4]
+    targets: Tensor, [h*w*num_anchors, 4],
+        t_x = (x-x_a)/w_a, t_y = (y-y_a)/h_a, t_w = log(w/w_a), t_h = log(h/h_a)
     '''
 
     overlaps = get_overlaps(mlv_anchors, gt_bbox)
@@ -58,7 +70,15 @@ def assign(mlv_anchors, mlv_valid_masks, gt_cls, gt_bbox, cfg):
     labels = torch.zeros_like(mlv_valid_masks, dtype=torch.int8)
 
     values, indices = torch.max(overlaps, dim=0)
-    targets = gt_bbox[indices]
+
+    # get targets
+    gt_bboxes = gt_bbox[indices]
+    gt_loc = bbox2loc(gt_bboxes)
+    anchors_loc = bbox2loc(mlv_anchors)
+    targets = torch.stack([(gt_loc[:, 0]-anchors_loc[:, 0])/anchors_loc[:, 2],
+                           (gt_loc[:, 1]-anchors_loc[:, 1])/anchors_loc[:, 3],
+                           torch.log(gt_loc[:, 2]/anchors_loc[:, 2]),
+                           torch.log(gt_loc[:, 3]/anchors_loc[:, 3])], dim=-1)
 
     # The first step
     labels[values >= cfg.assign_pos_thresh] = 1
@@ -71,6 +91,7 @@ def assign(mlv_anchors, mlv_valid_masks, gt_cls, gt_bbox, cfg):
     labels[values < cfg.assign_neg_thresh] = -1
 
     return labels, targets
+
 
 def get_overlaps(anchors, gt_bbox):
     '''
@@ -85,8 +106,10 @@ def get_overlaps(anchors, gt_bbox):
     ys_rb = torch.min(anchors[None, :, 3], gt_bbox[:, None, 3])
     return (ys_rb - ys_lt) * (xs_rb - xs_lt)
 
+
 def get_areas(bboxes):
     return (bboxes[:, 3] - bboxes[:, 1]) * (bboxes[:, 2] - bboxes[:, 0])
+
 
 def sample(labels, cfg):
     '''
@@ -114,6 +137,7 @@ def sample(labels, cfg):
     sample_labels[neg_inds] = -1
 
     return sample_labels
+
 
 def unmap(sample_labels, num_anchors, mlv_sizes):
     segments = [h*w*num_anchors for h, w in mlv_sizes]
